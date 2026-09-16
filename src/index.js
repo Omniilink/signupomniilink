@@ -18,19 +18,19 @@ export default {
     }
 
     try {
-      // API routes
-      if (path.startsWith('/api/')) {
-        const response = await handleAPI(request, env, path);
-        Object.entries(corsHeaders).forEach(([k, v]) => response.headers.set(k, v));
-        return response;
-      }
-
       // Public: ProDesk reports tunnel URL
       if (path === '/api/tunnel-update' && request.method === 'POST') {
         const { url, secret } = await request.json();
         if (secret !== env.TUNNEL_SECRET) return new Response('Unauthorized', { status: 401 });
         await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind('backend_url', url).run();
         return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      // API routes
+      if (path.startsWith('/api/')) {
+        const response = await handleAPI(request, env, path);
+        Object.entries(corsHeaders).forEach(([k, v]) => response.headers.set(k, v));
+        return response;
       }
 
       // Serve HTML page
@@ -61,12 +61,19 @@ async function handleAPI(request, env, path) {
   if (path === '/api/signup' && request.method === 'POST') {
     const { email, password, name } = await request.json();
     if (!email || !password) return json({ error: 'Email and password required' }, 400);
+    if (password.length < 8) return json({ error: 'Password must be at least 8 characters' }, 400);
 
-    const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
-    if (existing) return json({ error: 'Account already exists' }, 409);
+    const existingUser = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+    if (existingUser) return json({ error: 'Account already exists' }, 409);
 
     const hash = await hashPassword(password);
-    const result = await env.DB.prepare('INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)')
+
+    // Remove any existing pending signup for this email
+    await env.DB.prepare('DELETE FROM pending_signups WHERE email = ?').bind(email).run();
+    await env.DB.prepare('DELETE FROM verification_codes WHERE email = ? AND purpose = ?').bind(email, 'signup').run();
+
+    // Store in pending_signups (not users yet)
+    await env.DB.prepare('INSERT INTO pending_signups (email, password_hash, name) VALUES (?, ?, ?)')
       .bind(email, hash, name || '').run();
 
     const code = generateCode();
@@ -77,6 +84,24 @@ async function handleAPI(request, env, path) {
     await sendEmail(env, email, 'OmniLink Verification Code', `Your verification code is: ${code}\n\nThis code expires in 10 minutes.`);
 
     return json({ success: true, message: 'Verification code sent to your email' });
+  }
+
+  // POST /api/resend-code
+  if (path === '/api/resend-code' && request.method === 'POST') {
+    const { email } = await request.json();
+    if (!email) return json({ error: 'Email required' }, 400);
+
+    const user = await env.DB.prepare('SELECT id FROM pending_signups WHERE email = ?').bind(email).first();
+    if (!user) return json({ error: 'No unverified signup found' }, 400);
+
+    const code = generateCode();
+    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    await env.DB.prepare('UPDATE verification_codes SET used = 1 WHERE email = ? AND purpose = ?').bind(email, 'signup').run();
+    await env.DB.prepare('INSERT INTO verification_codes (email, code, purpose, expires_at) VALUES (?, ?, ?, ?)')
+      .bind(email, code, 'signup', expires).run();
+
+    await sendEmail(env, email, 'OmniLink Verification Code', `Your verification code is: ${code}\n\nThis code expires in 10 minutes.`);
+    return json({ success: true, message: 'New code sent' });
   }
 
   // POST /api/verify
@@ -90,8 +115,17 @@ async function handleAPI(request, env, path) {
 
     if (!record) return json({ error: 'Invalid or expired code' }, 400);
 
+    // Get the pending signup
+    const pending = await env.DB.prepare('SELECT email, password_hash, name FROM pending_signups WHERE email = ?').bind(email).first();
+    if (!pending) return json({ error: 'No pending signup found. Please sign up again.' }, 400);
+
+    // Create the actual user account
+    await env.DB.prepare('INSERT INTO users (email, password_hash, name, email_verified) VALUES (?, ?, ?, 1)')
+      .bind(pending.email, pending.password_hash, pending.name).run();
+
+    // Clean up
     await env.DB.prepare('UPDATE verification_codes SET used = 1 WHERE id = ?').bind(record.id).run();
-    await env.DB.prepare('UPDATE users SET email_verified = 1 WHERE email = ?').bind(email).run();
+    await env.DB.prepare('DELETE FROM pending_signups WHERE email = ?').bind(email).run();
 
     const user = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
     const token = await createSession(env, user.id);
@@ -140,6 +174,7 @@ async function handleAPI(request, env, path) {
   // POST /api/reset-password
   if (path === '/api/reset-password' && request.method === 'POST') {
     const { email, code, newPassword } = await request.json();
+    if (!newPassword || newPassword.length < 8) return json({ error: 'Password must be at least 8 characters' }, 400);
     const record = await env.DB.prepare(
       'SELECT id FROM verification_codes WHERE email = ? AND code = ? AND purpose = ? AND used = 0 AND expires_at > datetime(\'now\')'
     ).bind(email, code, 'reset').first();
@@ -232,8 +267,16 @@ async function verifyPassword(password, hash) {
   return h === hash;
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  const num = (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+  return (100000 + (num % 900000)).toString();
 }
 
 function generateToken() {
@@ -262,12 +305,25 @@ async function authenticateUser(request, env) {
 
 async function sendEmail(env, to, subject, body) {
   try {
-    await env.EMAIL.send({
-      from: 'OmniLink <noreply@omniilink.workers.dev>',
-      to,
-      subject,
-      text: body,
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + env.RESEND_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: 'OmniLink <onboarding@resend.dev>',
+        to: [to],
+        subject,
+        text: body,
+      }),
     });
+    const data = await resp.json();
+    if (data.id) {
+      console.log('Email sent:', data.id);
+    } else {
+      console.log('Email failed:', JSON.stringify(data));
+    }
   } catch (e) {
     console.log('Email send failed:', e.message);
   }
@@ -347,11 +403,6 @@ input:focus{border-color:var(--accent)}
     <p class="subtitle">Get started with OmniLink</p>
     <div id="signup-error" class="error"></div>
     <div id="signup-success" class="success"></div>
-    <button class="btn btn-google" onclick="signupWithGoogle()">
-      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-      Sign up with Google
-    </button>
-    <div class="divider">or</div>
     <div class="form-group">
       <label>Name</label>
       <input type="text" id="signup-name" placeholder="Your name">
@@ -373,11 +424,6 @@ input:focus{border-color:var(--accent)}
     <h2>Sign In</h2>
     <p class="subtitle">Welcome back to OmniLink</p>
     <div id="signin-error" class="error"></div>
-    <button class="btn btn-google" onclick="signinWithGoogle()">
-      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-      Sign in with Google
-    </button>
-    <div class="divider">or</div>
     <div class="form-group">
       <label>Email</label>
       <input type="email" id="signin-email" placeholder="you@example.com">
@@ -471,8 +517,7 @@ input:focus{border-color:var(--accent)}
       <h4>Getting Started</h4>
       <ol>
         <li>Add your API keys above (get them from provider websites)</li>
-        <li>Go to <a href="https://use.omniilink.workers.dev" style="color:var(--accent)">use.omniilink.workers.dev</a></li>
-        <li>Sign in with the same account</li>
+        <li>Go to <a href="https://useomniilink.omniilink.workers.dev" onclick="launchApp(event)" style="color:var(--accent)">useomniilink.omniilink.workers.dev</a></li>
         <li>Start chatting with AI models!</li>
       </ol>
     </div>
@@ -560,7 +605,9 @@ async function doVerify() {
 }
 
 async function resendCode() {
-  await api('/api/signup', 'POST', { email: currentEmail, password: 'resend' });
+  const r = await api('/api/resend-code', 'POST', { email: currentEmail });
+  if (r.error) return showError('verify-error', r.error);
+  showError('verify-error', 'New code sent! Check your email.');
 }
 
 async function doForgot() {
@@ -588,8 +635,8 @@ async function loadDashboard() {
   if (r.error) { showView('signin'); return; }
   const u = r.user;
   document.getElementById('user-info').innerHTML =
-    '<div style="font-size:14px;font-weight:600">' + (u.name || u.email) + '</div>' +
-    '<div style="font-size:12px;color:var(--text2)">' + u.email + '</div>';
+    '<div style="font-size:14px;font-weight:600">' + escapeHtml(u.name || u.email) + '</div>' +
+    '<div style="font-size:12px;color:var(--text2)">' + escapeHtml(u.email) + '</div>';
   const used = (u.storage_used_bytes / 1073741824).toFixed(2);
   const limit = (u.storage_limit_bytes / 1073741824).toFixed(0);
   const pct = (u.storage_used_bytes / u.storage_limit_bytes * 100).toFixed(1);
@@ -603,7 +650,7 @@ async function loadKeys() {
   const list = document.getElementById('key-list');
   if (!r.keys || r.keys.length === 0) { list.innerHTML = '<p style="font-size:12px;color:var(--text2)">No API keys added yet</p>'; return; }
   list.innerHTML = r.keys.map(k =>
-    '<div class="key-item"><span class="provider">' + k.provider + '</span><span class="date">Added ' + new Date(k.created_at).toLocaleDateString() + '</span><button class="del" onclick="deleteKey(' + k.id + ')">&times;</button></div>'
+    '<div class="key-item"><span class="provider">' + escapeHtml(k.provider) + '</span><span class="date">Added ' + new Date(k.created_at).toLocaleDateString() + '</span><button class="del" onclick="deleteKey(' + k.id + ')">&times;</button></div>'
   ).join('');
 }
 
@@ -621,18 +668,20 @@ async function deleteKey(id) {
   loadKeys();
 }
 
+function launchApp(e) {
+  e.preventDefault();
+  const token = localStorage.getItem('omnilink_token');
+  if (token) {
+    window.location.href = 'https://useomniilink.omniilink.workers.dev?token=' + token;
+  } else {
+    window.location.href = 'https://useomniilink.omniilink.workers.dev';
+  }
+}
+
 function doSignout() {
   localStorage.removeItem('omnilink_token');
   localStorage.removeItem('omnilink_email');
   showView('signin');
-}
-
-function signupWithGoogle() {
-  window.location.href = 'https://accounts.google.com/o/oauth2/auth?client_id=YOUR_GOOGLE_CLIENT_ID&redirect_uri=' + encodeURIComponent(window.location.origin + '/api/google/callback') + '&scope=email+profile&response_type=code';
-}
-
-function signinWithGoogle() {
-  signupWithGoogle();
 }
 
 // Auto-login if token exists
