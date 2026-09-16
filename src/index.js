@@ -25,6 +25,14 @@ export default {
         return response;
       }
 
+      // Public: ProDesk reports tunnel URL
+      if (path === '/api/tunnel-update' && request.method === 'POST') {
+        const { url, secret } = await request.json();
+        if (secret !== env.TUNNEL_SECRET) return new Response('Unauthorized', { status: 401 });
+        await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind('backend_url', url).run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+      }
+
       // Serve HTML page
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
