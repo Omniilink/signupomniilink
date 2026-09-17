@@ -27,9 +27,25 @@ export default {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
         }
-        await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
-          .bind('backend_url', body.url).run();
-        return new Response(JSON.stringify({ ok: true }), {
+        if (!body.url || !body.url.startsWith('https://')) {
+          return new Response(JSON.stringify({ error: 'Invalid URL' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+        try {
+          await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+            .bind('backend_url', body.url).run();
+          await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+            .bind('backend_url_updated_at', new Date().toISOString()).run();
+        } catch (dbErr) {
+          console.error('D1 write failed:', dbErr);
+          return new Response(JSON.stringify({ error: 'Database write failed' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true, url: body.url }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       }
